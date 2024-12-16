@@ -1,0 +1,601 @@
+---
+title: "Fotocasa rent price analysis"
+author: "sarcepi"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: cerulean
+    highlight: textmate
+    navbar:
+      title: "My Site"
+      type: tabs
+      left:
+        - text: "Home"
+          href: index.html
+        - text: "About"
+          href: about.html
+      right:
+        - text: "GitHub"
+          href: https://github.com/your-repo
+        - text: "Help"
+          href: help.html
+---
+
+
+## Introduction
+![Apartment Example](/Users/aa/Downloads/fotocasa2.jpg)
+
+In this analysis, I will build different types of machine learning (ML) models to predict the rental price of apartments in Madrid. The key features used for prediction include the surface area, number of bathrooms, number of rooms, and the neighborhood where the apartment is located.
+
+The data for this analysis was obtained through a web scraping project from the real estate website Fotocasa.com, which is a well-known and widely used platform in Spain for property listings.
+
+
+## Libraries
+```{r,message=FALSE, warning=FALSE, results='hide'}
+library(dplyr)
+library(caret)
+library(ModelMatrixModel)
+library(mgcv)
+library(ggplot2)
+library(sf)
+library(car)
+library(corrplot)
+library(MASS)
+library(RcmdrMisc)
+library(randomForest)
+library(gbm)
+library(mpae)
+library(knitr)
+library(pdp)
+library(gridExtra)
+library(glmnet)
+```
+## Preprocessing the data and Exploratory Data Analysis.
+```{r}
+data<-read.csv2("/Users/aa/Downloads/apartment_data (2).csv",sep=",",header=T)
+madrid<-data[251:nrow(data),]
+summary(madrid)
+glimpse(madrid)
+
+```
+
+From the summary function, we can obtain plenty of information from the data. The first step would be to change the variable type for "Price" since it is essential to have it as numeric. Next, it is noticeable that there is a significant amount of NA data, which will be problematic for the subsequent stages of the analysis. Therefore, it is better to remove those rows with NA values from the dataset.
+
+Afterwards, it is essential to analyze the distribution of the variables and their potential influence on the target variable. For instance, the relationship between the number of rooms and the rent price should be examined in detail.
+
+The exploratory data analysis will include various graphical representations such as histograms, scatter plots, and boxplots to visualize the relationships between the variables.
+
+```{r}
+madrid$Price<-as.numeric(gsub("\\.","",madrid$Price))
+madrid<-madrid%>%
+    filter(Zona!="Capital")
+madrid <- madrid %>%
+  mutate(Zona = ifelse(Zona %in% c("Barrio de Salamanca", "Salamanca"), "Salamanca", Zona)) %>%
+  mutate(Zona = ifelse(Zona %in% c("Blas", "San Blas"), "San Blas - Canillejas", Zona)) %>%
+  mutate(Zona = ifelse(Zona %in% c("Vallecas","Villa de Vallecas"), "Villa de Vallecas", Zona)) %>%
+  mutate(Zona = ifelse(Zona %in% c("Lineal", "Ciudad Lineal"), "Ciudad Lineal", Zona)) %>%
+  mutate(Zona = ifelse(Zona %in% c("Moncloa - Aravaca", "Aravaca"), "Moncloa - Aravaca", Zona)) %>%
+  filter(Bathrooms < 10) %>%
+  filter(Square.Meters > 10) %>%
+  mutate(Zona = as.factor(Zona))
+
+madrid<-na.omit(madrid)  
+summary(madrid)
+glimpse(madrid )
+```
+
+First things first, there are pretty high values in Price and Square.Meters that look like outliers.
+
+```{r}
+ggplot(madrid, aes(x = Price)) +
+  geom_histogram(binwidth = 500, fill = "skyblue", color = "black") +
+  labs(title = "Histogram of Price",
+       x = "Price",
+       y = "Frequency") +
+  theme_classic()
+```
+```{r}
+ggplot(madrid, aes(x = Square.Meters)) +
+  geom_histogram(binwidth = 100, fill = "skyblue", color = "black") +
+  labs(title = "Histogram of Square.Meters",
+       x = "Price",
+       y = "Frequency") +
+  theme_classic()
+```
+
+
+Both histograms are very asymetrical specially Square Meters indicating the presence of big outliers.
+
+```{r}
+ggplot(madrid, aes(x = `Square.Meters`, y = Price,color = Zona)) +
+  geom_point() +
+  labs(title = "Price vs. Square Meters",
+       x = "Square.Meters",
+       y = "Price") +
+  theme_classic()
+
+```
+
+Here we can clearly see two big outliers for Square.Meters and three for the Price variable.
+
+
+```{r,echo=F}
+par(mfrow=c(1,2))
+ggplot(madrid) +
+  aes(x = "", y = Price) +
+  geom_boxplot(fill = "blue") +
+  theme_minimal()
+ggplot(madrid) +
+  aes(x = "", y = Square.Meters) +
+  geom_boxplot(fill = "blue") +
+  theme_minimal()
+```
+
+```{r,echo=FALSE}
+par(mfrow=c(1,2))
+ggplot(madrid) +
+  aes(x = "", y = Bathrooms) +
+  geom_boxplot(fill = "blue") +
+  theme_minimal()
+ggplot(madrid) +
+  aes(x = "", y = Rooms) +
+  geom_boxplot(fill = "blue") +
+  theme_minimal()+
+  ggtitle("Rooms")
+
+```
+
+Now lets remove the first three biggest values in Price.
+```{r}
+top_prices_indices <- order(madrid$Price, decreasing = TRUE)[1:3]
+madrid$Price[top_prices_indices]
+madrid <- madrid[-top_prices_indices, ]
+```
+These data prices are huge so its better to remove them otherwise we can have problems with the regression models.
+
+
+Following the same procedure for the two values in Square Meters.
+```{r}
+top_prices_indices2 <- order(madrid$Square.Meters, decreasing = TRUE)[1:3]
+madrid$Square.Meters[top_prices_indices2]
+madrid <- madrid[-top_prices_indices2, ]
+```
+
+
+```{r}
+madrid_subset <- madrid[, !names(madrid) %in% "Zona"]
+plot(madrid_subset)
+```
+There is some type of linear relationship between some variables like rooms and square meters and also bathrooms and square meters, this is not really surprising considering that in general if a aparment has lots of rooms it also has to have more spacel.This relationship between variables can be a problem when using linear regression models,so its important to take a look at the colinearity when using those types of models.
+
+```{r,echo=FALSE}
+theme1 <- trellis.par.get()
+theme1$plot.symbol$col = rgb(.2, .2, .2, .4)
+theme1$plot.symbol$pch = 16
+theme1$plot.line$col = rgb(1, 0, 0, .7)
+theme1$plot.line$lwd <- 2
+trellis.par.set(theme1)
+featurePlot(x = madrid[, c("Square.Meters","Rooms","Bathrooms")], 
+            y = madrid$Price, 
+            plot = "scatter", 
+            layout = c(3, 1))
+```
+This plot shows the relationship between Price and some variables in the data set. It`s clear that there's a linear trend and also a lot of outliers in the data.The data points seem to have a lot of variance, to reduce the variability and increase the performance of the models the log transformation will be used in the Price column, this way the data will look like this.
+
+```{r,echo=FALSE}
+theme1 <- trellis.par.get()
+theme1$plot.symbol$col = rgb(.2, .2, .2, .4)
+theme1$plot.symbol$pch = 16
+theme1$plot.line$col = rgb(1, 0, 0, .7)
+theme1$plot.line$lwd <- 2
+trellis.par.set(theme1)
+featurePlot(x = madrid[, c("Square.Meters","Rooms","Bathrooms")], 
+            y = log(madrid$Price), 
+            plot = "scatter",type = c("p", "smooth"),
+            span = 1, 
+            layout = c(3, 1))
+```
+Now the data its less scatter and more tight.The trend now looks a bit different from the other plot,you could say that there's a cuadratic relationship between Prices and Square Meters, the interpretation would be that the prices increases as the square meters increase but only up to a point where the increase of the price is smaller in marginal terms.
+
+
+In the case of the variable Zona we have 23 neighborhoods for the city of madrid.Here`s a map that shows the amount of aparments for each district.
+```{r,echo=F}
+madrid_map <- st_read("/Users/aa/Downloads/Distritos/Distritos.shp")
+madrid_map$Zona<-madrid_map$NOMBRE
+unique(madrid$Zona)
+madrid <- madrid[madrid$Zona != "Capital", ]
+
+apartment_summary <- madrid %>%
+  group_by(Zona) %>%
+  summarise(apartments = n())
+
+madrid_map <- madrid_map %>%
+  left_join(apartment_summary, by = "Zona")
+
+madrid_map$apartments[is.na(madrid_map$apartments)] <- 0
+
+ggplot(data = madrid_map) +
+  geom_sf(aes(fill = apartments)) +  # Fill districts based on the 'apartments' count
+  scale_fill_gradientn(
+    colors = c("lightblue", "green", "yellow", "red"),
+    values = scales::rescale(c(0, max(madrid_map$apartments)/4, max(madrid_map$apartments)/2, max(madrid_map$apartments))),
+    na.value = "grey"
+  ) +
+  labs(
+    title = "Apartments by District in Madrid",
+    fill = "Number of Apartments"
+  ) +
+  theme_minimal()
+
+zona_table <- table(madrid$Zona)
+
+# Display the table using knitr's kable() function
+kable(zona_table, caption = "Frequency Table of Zona")
+```
+
+A good portion of the aparments are located in the city center and closer areas, in the other hand cheaper neighborhoods have less presence in the data set, this can explain  why the average prices is so high (2570.575).
+
+*Note: I think Fotocasa.com  has change the way neighborhood info is display, now instead of having the neighborhood name it has the street name. This could be great for doing spatial analysis.
+
+## Modeling the data
+
+This analysis is going to be performed from a machine learning perspective, this means that first the data will be split into two different groups,train and test, the train part is designed to adjust the models parameters and the test is for evaluating the performance. Sencondly the aim of the data modelling is going to be maximizing the accuracy of the predictions,that means we will  be less strict with models assumptions.
+
+```{r}
+set.seed(1)
+nobs <- nrow(madrid)
+itrain <- sample(nobs, 0.8 * nobs)
+train <- madrid[itrain, ]
+test <- madrid[-itrain, ]
+train$Price <- log(train$Price)
+test$Price <- log(test$Price)
+dim(train)
+dim(test)
+```
+### Linear Regression
+
+Linear regression is a popular and straightforward model that is easy to apply and provides a clear understanding of how variables interact with each other. The main objective of linear regression is to find a line that minimizes the following equation.
+
+$$
+\text{MSE} = \frac{1}{n} \sum_{i=1}^{n} (y_i - \hat{y}_i)^2
+$$
+Where:
+- $ n $ is the number of observations,
+- $y_i $ is the actual value,
+- $\hat{y}_i$ is the predicted value.
+
+In simpler terms, the goal is to identify a line in the variable space that minimizes the differences between the observed values (e.g., actual prices) and the predicted values generated by the model.
+
+While linear regression is a great starting point due to its simplicity and interpretability, it is not always the most flexible model for handling diverse data. This limitation arises from the assumptions it makes:
+
+1.Linearity: The relationship between the predictors and the response variable is assumed to be linear. If the true relationship is nonlinear, the model may struggle to fit the data accurately.In this case this is not an issue since the data seems to have linear relationships as said before.
+
+2.Independence: The observations are assumed to be independent of each other.
+
+3.Homoscedasticity: The variance of the residuals (errors) should remain constant across all levels of the predictors.
+
+4.Normality of Residuals: The residuals are assumed to follow a normal distribution.
+
+5.No Multicollinearity: The predictors should not be highly correlated with each other, as multicollinearity can make the model unstable and affect the interpretation of coefficients.
+
+Violating these assumptions can lead to biased estimations or poor predictive performance.
+
+Lets fit the model.
+
+```{r} 
+linear_model<-lm(Price~Square.Meters+Rooms+Bathrooms+Zona,data=train)
+summary(linear_model)
+```
+Right off the bat we get a pretty solid model in terms of variable signification.There are a few areas that are not significative such as Moncloa - Aravaca,Pardo and Tetuán.The r squared is not to high but with a few adjustment we can increase it.
+
+
+Now its time to check the assumptions made by the model.First lets analyze the residuals to check whether they are normal or not.
+```{r}
+res<-linear_model$residuals
+qqPlot(res)
+```
+The data doesn't look normal from the qqplot, so lets run a shapiro test to measure it.
+
+```{r}
+shapiro.test(res)
+```
+
+The residuals are clearly not normal distributed. Depending on the goal of the analysis this could be an issue.If the goal is to predict is not the end of the world and we still can trust the prediction resutls, but, if the goal is to make inference from the data this is problematic since we won't be able to trust the models outcomes.
+
+Lets test multicolinearity.
+```{r}
+madrid_subset <- madrid[, !names(madrid) %in% "Zona"]
+mat_cor<-cor(madrid_subset)
+corrplot(mat_cor,method = "ellipse")
+```
+
+```{r}
+car::vif(linear_model)
+```
+It doesn't look that there`s much multicolinearity between the variables in the model fitted.
+Now its time to use the stepwise function which will select the variables in the model dropping the non significative ones.
+```{r}
+final_linear_model<-stepwise(linear_model)
+```
+The final model has the variables Square Meters, Bathrooms ,Rooms and Zona.
+
+Looking at the relationship between the variables I suggest adding the interaction of Square Meters ,Bathrooms and Rooms
+```{r}
+model_with_interaction<-lm(Price~(Square.Meters*Bathrooms*Rooms)+Zona,data=train)
+summary(model_with_interaction)
+```
+```{r}
+car::vif(model_with_interaction, type = 'predictor')
+```
+No problems with multicollinearity.
+
+To make sure this model is better than the previuos one we can use the Analysis of variance.(Anova)
+
+```{r}
+anova(final_linear_model,model_with_interaction)
+```
+The p value is very small indicating that the second model explainds better the data.
+
+For measuring the accuracy of the model will be using RMSE and the $\ R^2$.
+
+```{r}
+accuracy <- function(pred, obs, na.rm = FALSE, 
+                     tol = sqrt(.Machine$double.eps), 
+                     row_name = NULL, 
+                     results_df = NULL) {
+  
+  # Calculate errors
+  err <- obs - pred 
+  
+  if(na.rm) {
+    is.a <- !is.na(err)
+    err <- err[is.a]
+    obs <- obs[is.a]
+  }
+  
+  # Calculate metrics
+  metrics <- c(
+    rmse = sqrt(mean(err^2)), 
+    mae = mean(abs(err)), 
+    r.squared = 1 - sum(err^2) / sum((obs - mean(obs))^2)
+  )
+  
+  # Convert metrics to a data frame
+  metrics_df <- as.data.frame(t(metrics))
+  
+  # Add row name if provided
+  if (!is.null(row_name)) {
+    rownames(metrics_df) <- row_name
+  }
+  
+  # Append metrics to the results data frame if provided
+  if (!is.null(results_df)) {
+    results_df <- rbind(results_df, metrics_df)
+  } else {
+    results_df <- metrics_df
+  }
+  
+  return(results_df)
+}
+
+```
+
+```{r}
+obs<-test$Price
+lm_prediction<-predict(model_with_interaction,newdata=test)
+ab<-accuracy(lm_prediction,test$Price,na.rm = T,row_name = "Linear Regression" )
+```
+```{r}
+pred.plot(lm_prediction, obs, xlab = "Predicción", ylab = "Observado")
+```
+
+### Ridge Regression
+
+$$
+\hat{y} = X \beta + \lambda \sum_{j=1}^{p} \beta_j^2
+$$
+ Where 𝜆 is the penalty parameter.This type of model tends to consider all the variables but reducing the size of the coefficients.
+
+```{r}
+x_train<-(model.matrix(Price ~ ., data = train))[, -1]
+
+y_train<- train$Price
+
+x_test<-(model.matrix(Price ~ ., data = test))[, -1]
+y_test<-test$Price
+```
+
+```{r}
+set.seed(1)
+cv.ridge <- cv.glmnet(x_train, y_train, alpha = 0)
+plot(cv.ridge)
+cv.ridge$lambda.1se
+```
+Our lambda is 0.1724154.
+```{r}
+coef(cv.ridge)
+```
+As can be seen in the coefficients none of them are really high.
+```{r}
+pred <- predict(cv.ridge, newx = x_test) # s = "lambda.1se"
+ridge<-accuracy(pred, y_test,row_name = "Ridge regression");ridge
+performance<-rbind(ab,ridge)
+```
+### Lasso Regression
+
+$$
+\hat{y} = X \beta + \lambda \sum_{j=1}^{p} |\beta_j|
+$$
+LASSO can shrink some coefficients to exactly zero. This effectively removes certain features from the model, making it useful for feature selection.
+
+```{r}
+cv.lasso<- cv.glmnet(x_train, y_train, alpha = 1)
+plot(cv.lasso)
+cv.lasso$lambda.1se
+```
+```{r}
+coef(cv.lasso)
+```
+Here the coefficients remove are exactly those that where non significant in the linear regression model, so the final model has 19 variables.
+```{r}
+pred <- predict(cv.lasso, newx = x_test)
+lasso<-accuracy(pred, y_test,row_name = "Lasso");lasso
+performance<-rbind(performance,lasso)
+```
+
+### Elastic Net
+ 
+Elastic Net combines LASSO and Ridge.
+```{r}
+caret.glmnet <- train(x_train, y_train, method = "glmnet", 
+                      preProc = c("zv", "center", "scale"), tuneLength = 10,
+                      trControl = trainControl(method = "cv", number = 10))
+caret.glmnet
+```
+Here I used a bunch of different combinations of parameters to see if got better results.
+```{r}
+ggplot(caret.glmnet, highlight = TRUE)
+```
+```{r}
+pred <- predict(caret.glmnet, newdata = x_test)
+elastic<-accuracy(pred, y_test,row_name = "Elastic Net")
+performance<-rbind(performance,elastic)
+```
+
+### Random Forest
+```{r}
+rf<-randomForest(Price~.,data=train);rf
+```
+
+```{r}
+plot(rf, main = "Random Forest")
+```
+
+The error stabilizes around 200 trees in.
+
+```{r}
+varImpPlot(rf)
+```
+
+Using random forest we can see which variables are the most important.Square Meters its the most important one followed by Bathrooms, these two variables explained most of the model, then we get Zona (neighborhood) and finally Room seems to be the less important, this could be because the the information contained in Rooms is already contain in Square Meters.
+```{r}
+pdp1 <- partial(rf, "Square.Meters")
+p1 <- plotPartial(pdp1)
+pdp2 <- partial(rf, c("Bathrooms"))
+p2 <- plotPartial(pdp2)
+pdp3 <- partial(rf, c("Rooms"))
+p3 <- plotPartial(pdp3)
+grid.arrange(p1, p2,p3, ncol = 3)
+```
+
+The partial plot allow us to see how one particular variable interacts with the target variable. In this case we can see that increasing the surface of the aparments increases the prices up to a certain point where stops, this could be caused by a lack of data.The bathrooms have the same trend and finally increasing the number of rooms increases the price but when we get to 7 rooms there's a decrease of the price, again this could either be because the lack of data (I think there's only one aparment with 10 rooms) or it coulb be an underlying trend.
+```{r}
+pred <- predict(rf, newdata = test)
+rf<-accuracy(pred, obs,row_name = "Random Forest");rf
+performance<-rbind(performance,rf)
+```
+
+### Generalize Additive Models (GAM)
+```{r}
+gam <- gam(
+  Price ~ s(Square.Meters,Bathrooms,Rooms)+ Zona, 
+  data = train, 
+  family = gaussian()
+)
+summary(gam)
+```
+
+```{r,warning=FALSE}
+vis.gam(gam, view = c("Square.Meters", "Bathrooms"), plot.type = "persp", 
+        theta = 30, phi = 30, 
+        main = "3D Interaction of Square Meters and Bathrooms",
+        color = "heat", zlab = "Price")
+```
+```{r,warning=FALSE}
+vis.gam(gam, view = c("Square.Meters", "Bathrooms"), plot.type = "contour", 
+        color = "topo", main = "2D Contour Plot of Square Meters and Bathrooms")
+
+
+```
+In those two graphs we can see the interaction between the surface and bathrooms.The interaction between them can be clearly seen.
+
+
+
+
+```{r}
+pred <- predict(gam, newdata = test)
+g<-accuracy(pred, obs,row_name = "GAM");g
+performance<-rbind(performance,g)
+```
+
+
+```{r}
+pred.plot(pred, obs, xlab = "Predicción", ylab = "Observado")
+```
+
+
+### Boosting
+```{r,results='hide'}
+trControl <- trainControl(method = "cv", number = 5)
+
+caret.xgb <- train(Price ~ ., method = "xgbTree", data = train,
+                   trControl = trControl, verbosity = 0)
+caret.xgb
+```
+
+
+```{r}
+pred <- predict(caret.xgb, newdata = test)
+xgb<-accuracy(pred, obs,row_name = "XGB");xgb
+performance<-rbind(performance,xgb)
+```
+
+
+## Results
+
+```{r,echo=FALSE}
+kable(performance,main="Models Performance")
+```
+
+```{r,echo=F}
+performance_df <- data.frame(
+  Model = rownames(performance),
+  R_Squared = performance$r.squared
+)
+ggplot(performance_df, aes(x = Model, y = R_Squared, fill = Model)) +
+  geom_bar(stat = "identity") + 
+  labs(x = "Model", y = "R-Squared", title = "R-Squared Performance by Model") +
+  theme_minimal() +  
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+```
+
+
+```{r,echo=F}
+performance_df <- data.frame(
+  Model = rownames(performance),
+  R_Squared = performance$rmse
+)
+ggplot(performance_df, aes(x = Model, y = R_Squared, fill = Model)) +
+  geom_bar(stat = "identity") + 
+  labs(x = "Model", y = "RMSE", title = "RMSE Performance by Model") +
+  theme_minimal() +  
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+```
+```{r,echo=FALSE}
+performance_df <- data.frame(
+  Model = rownames(performance),
+  R_Squared = performance$mae
+)
+ggplot(performance_df, aes(x = Model, y = R_Squared, fill = Model)) +
+  geom_bar(stat = "identity") + 
+  labs(x = "Model", y = "MAE", title = "MAE Performance by Model") +
+  theme_minimal() +  
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+```
+
+
+After testing different models, the results were quite similar. The XGBoost model had the highest R-squared, but the difference compared to the other models was very small. For this reason, the linear regression model seems like a better option because it is simple, easy to understand, and works efficiently.
+
+In summary, the models were not able to fully explain the variations in the data. One of the main challenges was the high variability in the data, which made it difficult for the models to detect clear patterns. Another possible reason is the lack of important information, such as the condition or quality of the apartment, which can have a big effect on the rental price. Including this type of information in future models could help improve the predictions.
